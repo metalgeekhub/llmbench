@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/metalgeekhub/llmbench/internal/clock"
 )
 
 // openAI is the adapter for OpenAI-compatible servers (OpenAI, vLLM, SGLang,
@@ -88,6 +90,20 @@ func (o *openAI) ListModels(ctx context.Context) ([]string, error) {
 func (o *openAI) buildBody(req ChatRequest) ([]byte, error) {
 	body := MergeJSON(nil, o.cfg.ExtraBody)
 	body = MergeJSON(body, req.ExtraBody)
+	if t := req.Thinking; t != nil {
+		switch t.Style {
+		case StyleReasoningEffort:
+			effort := t.Level
+			if effort == ThinkingOff {
+				effort = "none"
+			}
+			body["reasoning_effort"] = effort
+		case StyleChatTemplate:
+			body = MergeJSON(body, map[string]any{
+				"chat_template_kwargs": map[string]any{"enable_thinking": t.Level != ThinkingOff},
+			})
+		}
+	}
 	body["model"] = req.Model
 	body["messages"] = req.Messages
 	body["stream"] = true
@@ -149,7 +165,7 @@ func (o *openAI) StreamChat(ctx context.Context, req ChatRequest, emit func(Even
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	for sc.Scan() {
-		now := time.Now()
+		now := clock.Now()
 		line := sc.Bytes()
 		data, ok := bytes.CutPrefix(line, []byte("data:"))
 		if !ok {

@@ -95,7 +95,7 @@ func (s *server) discoverModels(w http.ResponseWriter, r *http.Request) {
 // --- chat ---
 
 func (s *server) listSessions(w http.ResponseWriter, r *http.Request) {
-	list, err := s.Store.ListSessions(r.Context())
+	list, err := s.Store.ListSessions(r.Context(), r.URL.Query().Get("compare_id"))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -210,6 +210,8 @@ func (s *server) listRequests(w http.ResponseWriter, r *http.Request) {
 		Model:     q.Get("model"),
 		Status:    q.Get("status"),
 		SessionID: q.Get("session_id"),
+		RunID:     q.Get("run_id"),
+		CellID:    q.Get("cell_id"),
 		Limit:     min(max(limit, 0), 500),
 		Offset:    offset,
 	}

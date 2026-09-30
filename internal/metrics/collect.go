@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metalgeekhub/llmbench/internal/clock"
 	"github.com/metalgeekhub/llmbench/internal/providers"
 	"github.com/metalgeekhub/llmbench/internal/tokenizer"
 )
@@ -39,7 +40,7 @@ func Collect(ctx context.Context, p providers.Provider, req providers.ChatReques
 		last               time.Time
 	)
 
-	start := time.Now()
+	start := clock.Now()
 	err := p.StreamChat(ctx, req, func(e providers.Event) {
 		switch e.Type {
 		case providers.EventContent:
@@ -58,7 +59,7 @@ func Collect(ctx context.Context, p providers.Provider, req providers.ChatReques
 			onEvent(e)
 		}
 	})
-	end := time.Now()
+	end := clock.Now()
 	if err == nil && !last.IsZero() {
 		// E2E ends at the final chunk, not when the connection closed.
 		end = last

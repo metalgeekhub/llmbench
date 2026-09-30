@@ -14,3 +14,16 @@ func TestCount(t *testing.T) {
 		t.Errorf("CountMessages = %d", got)
 	}
 }
+
+func TestSynthetic(t *testing.T) {
+	if Synthetic(0) != "" {
+		t.Error("Synthetic(0) should be empty")
+	}
+	for _, n := range []int{1, 50, 1000, 8000} {
+		got := Count(Synthetic(n))
+		// Re-encoding the cut point may merge or split one token.
+		if got < n-1 || got > n+1 {
+			t.Errorf("Synthetic(%d) has %d tokens", n, got)
+		}
+	}
+}

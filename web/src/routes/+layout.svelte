@@ -7,6 +7,8 @@
 
 	const links = [
 		{ href: '/chat', label: 'Chat' },
+		{ href: '/compare', label: 'Compare' },
+		{ href: '/benchmarks', label: 'Benchmarks' },
 		{ href: '/history', label: 'History' },
 		{ href: '/sources', label: 'Sources' }
 	];

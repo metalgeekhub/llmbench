@@ -204,6 +204,57 @@ func TestOpenAIListModels(t *testing.T) {
 	}
 }
 
+func TestThinkingMapping(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body = nil
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	// The source enables thinking by default; the control must override it.
+	p, _ := New(Config{Type: TypeOpenAI, BaseURL: srv.URL,
+		ExtraBody: map[string]any{"chat_template_kwargs": map[string]any{"enable_thinking": true, "keep": 1}}})
+
+	send := func(level, style string) {
+		t.Helper()
+		th, err := ParseThinking(level, style)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := p.StreamChat(context.Background(), ChatRequest{Model: "m", Thinking: th}, func(Event) {}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	send("off", StyleChatTemplate)
+	if kw := body["chat_template_kwargs"].(map[string]any); kw["enable_thinking"] != false || kw["keep"] != 1.0 {
+		t.Errorf("off/chat_template: %v", body)
+	}
+	send("high", StyleChatTemplate)
+	if kw := body["chat_template_kwargs"].(map[string]any); kw["enable_thinking"] != true {
+		t.Errorf("high/chat_template: %v", body)
+	}
+	send("medium", StyleReasoningEffort)
+	if body["reasoning_effort"] != "medium" {
+		t.Errorf("medium/reasoning_effort: %v", body)
+	}
+	send("off", StyleReasoningEffort)
+	if body["reasoning_effort"] != "none" {
+		t.Errorf("off/reasoning_effort: %v", body)
+	}
+	send("", "")
+	if _, ok := body["reasoning_effort"]; ok {
+		t.Errorf("server default must not send reasoning_effort: %v", body)
+	}
+
+	for _, bad := range [][2]string{{"max", StyleChatTemplate}, {"high", ""}, {"low", "magic"}} {
+		if _, err := ParseThinking(bad[0], bad[1]); err == nil {
+			t.Errorf("ParseThinking(%q, %q) should fail", bad[0], bad[1])
+		}
+	}
+}
+
 func TestNewUnsupported(t *testing.T) {
 	if _, err := New(Config{Type: "bedrock"}); err == nil {
 		t.Error("expected error for unsupported type")

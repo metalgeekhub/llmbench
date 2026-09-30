@@ -187,14 +187,15 @@ All metrics are measured client-side with a monotonic clock, using streaming res
 | **Prefill speed** | Input tokens / TTFT (approximate) | How fast the server processes long contexts |
 | **Aggregate throughput** | Total output tokens across all users / wall time | Server capacity under load |
 | **Request throughput** | Completed requests / second | Capacity in requests |
-| **Token usage** | Input, output, reasoning, cached tokens | Cost and behavior |
+| **Token usage** | Input, output, reasoning, cached tokens | Load and behavior (e.g. how much reasoning a setting adds) |
 | **Error rate** | Share of failed requests by type (429, 5xx, timeout, connection) | Stability and rate limits |
 | **Goodput** | Share of requests meeting user-defined targets (e.g. TTFT < 1s and TPOT < 50ms) | "Useful" capacity |
-| **Estimated cost** | Tokens × price per model (user-editable) | Cost comparison between providers |
 
 Every aggregate shows min, mean, p50, p90, p95, p99, and max.
 
 Some servers send several tokens per streamed chunk, so ITL is measured and labeled per chunk to avoid misleading numbers.
+
+Goodput (v0.4) targets are optional per run: max TTFT, max TPOT, max E2E and min output tokens/s per request. It is evaluated on demand from the stored requests, so targets can be set, changed or previewed after a run finishes. Results show the share of requests within the SLO and good requests per second per step, and for load sweeps the highest load at which at least 90% of requests meet the targets. On Windows, measurement timestamps use the high-resolution performance counter, because the default clock only advances in ~0.5 ms steps (too coarse for TTFT and inter-chunk gaps).
 
 ---
 
@@ -203,6 +204,10 @@ Some servers send several tokens per streamed chunk, so ITL is measured and labe
 A chat screen with a model selector and a parameters panel (temperature, max tokens, thinking level, system prompt, extra body). Under each response, a compact metrics strip shows TTFT, tokens/s, E2E latency, and token counts. Clicking it opens a detailed view with the full timing breakdown and a token-timeline chart. Reasoning content, when exposed by the provider, appears in a collapsible section with its own timing.
 
 **Compare mode** sends the same prompt to two to four model profiles at once and shows responses side by side, each streaming live with its own metrics, plus a summary row highlighting the best value per metric.
+
+**Synthetic prompts (chat and compare).** Instead of typing, the user can send a synthetic prompt of an exact token length (e.g. 4,096 tokens), optionally followed by their own instruction. This makes chat and compare usable for quick, controlled latency checks at a given context size. Synthetic prompts get a unique prefix per request so prefix caching can't favor one column over another. Long synthetic messages are shown collapsed ("Synthetic prompt · 4,096 tokens").
+
+**Visual scoreboard (compare).** Above the turns, a scoreboard shows each column's wins per metric across all turns and its average TTFT, end-to-end latency and output speed, so the fastest model is obvious at a glance. Per-turn summaries draw inline bars next to each value, and a stacked bar per column splits output into reasoning and answer tokens.
 
 ---
 
@@ -218,9 +223,9 @@ Tests are defined in a form-based builder in the UI (also saveable and exportabl
 
 **Concurrency sweep.** Runs with 1, 2, 4, 8, 16, 32, … simultaneous virtual users. Shows where throughput plateaus and latency climbs, identifying the saturation point.
 
-**Thinking comparison.** The same workload with thinking off/low/medium/high. Shows latency, token, and cost impact of reasoning, with optional side-by-side output.
+**Thinking comparison.** The same workload with thinking off/low/medium/high. Shows the latency and token impact of reasoning, with optional side-by-side output.
 
-**Matrix test.** Any combination, e.g. *context [4k, 32k] × concurrency [1, 8, 32] × thinking [off, high]* = 12 cells, each with its own results. Before starting, the builder shows total request count, estimated duration, and estimated cost.
+**Matrix test.** Any combination, e.g. *context [4k, 32k] × concurrency [1, 8, 32] × thinking [off, high]* = 12 cells, each with its own results. Before starting, the builder shows total request count and estimated duration.
 
 **Ramp and soak test.** Gradually increase users over time (e.g. 1 → 64 over 10 minutes), or hold constant load for a long period to find leaks, throttling, or degradation.
 
@@ -242,6 +247,14 @@ Active virtual users, requests in flight, requests/sec, live TTFT and tokens/s c
 
 A summary table per cell with all metrics and percentiles, plus charts: **throughput vs. concurrency**, **TTFT vs. context length**, **latency percentiles vs. load**, **tokens/s vs. thinking level**. A per-request table supports filtering and drill-down, including failed requests.
 
+**At a glance.** Every run opens with an overview built for a fast read:
+
+- **Headline tiles:** peak output throughput, best TTFT, success rate (as a meter), total requests and tokens, each naming the step where it happened.
+- **Automatic findings** in plain sentences, e.g. "Throughput plateaus at 8 users (716 tok/s); beyond that TTFT rises 5×", "32k context makes TTFT 11× slower than 1k", "Thinking high adds 760 ms before the answer".
+- **Donut charts** for request outcomes (succeeded / failed by error type / canceled) and token composition (input, reasoning, answer).
+- **Latency distribution:** histogram of TTFT or end-to-end latency across all requests, one line per model or step.
+- **Heatmap** for matrix runs: two dimensions (e.g. context × users) colored by the chosen metric.
+
 ### Measurement accuracy
 
 The load generator must never be the bottleneck. The engine monitors its own CPU usage and warns if saturated, uses a dedicated HTTP connection pool sized to the concurrency level (`MaxConnsPerHost`, `MaxIdleConnsPerHost`), and the UI notes that latency includes the network path, so server benchmarks should run close to the server.
@@ -251,6 +264,8 @@ The load generator must never be the bottleneck. The engine monitors its own CPU
 ## 8. Comparison
 
 Select any set of test runs, chat requests, or model profiles and open a comparison view: side-by-side metric tables with the best value highlighted per row, overlaid charts (e.g. throughput-vs-concurrency curves for three models on one chart), and relative differences ("Model B has 38% lower p95 TTFT at 16 users"). Comparisons can be saved and exported. Imported runs can be compared too, enabling cross-machine comparisons.
+
+The comparison view opens with **winner tiles**: for each headline metric (peak throughput, best TTFT, best end-to-end latency, error rate), which run and model is best and by how much over the runner-up. In the benchmarks list, runs are selected with checkboxes; a persistent action bar shows how many are selected and enables "Compare" from two runs on.
 
 ---
 
@@ -284,6 +299,13 @@ History screens support search and filter by model, date, test type, and tags; o
 | **k6 script** | Optional, to reproduce the load in an existing k6 setup |
 | **Parquet** | Later phase, for large datasets and analysis pipelines |
 
+JSON, CSV, HTML and Markdown shipped in v0.4; k6 and Parquet remain later-phase items. Details as built:
+
+- **JSON bundle**: `{"format": "llmbench", "version": 1, "runs": [...]}` with each run's config, steps and every request (with chunk timelines). Exported from a run, from a selection in the Benchmarks list, or from a comparison. Importing skips runs already present (same ID) and marks the others as imported; a run that was still in progress when exported is imported as interrupted.
+- **CSV**: one row per request (with an `slo_met` column when the run has SLO targets), or one row per step with all percentiles and goodput.
+- **HTML / Markdown**: generated in the browser from the same data and automatic findings as the run and comparison pages; the HTML file is self-contained, with charts as inline SVG.
+- **Test definitions** export as YAML or JSON (`kind: llmbench-definition`) and import from the same Import button as run bundles.
+
 A **Prometheus `/metrics` endpoint** is planned so live test metrics can feed existing Grafana dashboards.
 
 ---
@@ -314,7 +336,8 @@ Kubernetes: a small Helm chart (Deployment + PersistentVolumeClaim for the SQLit
 | **MVP** | Single binary, SQLite, env + UI source config, OpenAI-compatible adapter, chat with per-message metrics, request history |
 | **v0.2** | Anthropic and Gemini adapters, thinking controls, side-by-side chat compare, single benchmark and concurrency sweep, live dashboard |
 | **v0.3** | Context sweep, thinking comparison, matrix tests, open-loop load model, results charts, run comparison view |
-| **v0.4** | Exports (JSON, CSV, HTML, Markdown), import, saved test definitions, goodput/SLOs, cost estimation |
+| **v0.3.5** | Visual insights: run "at a glance" overview (headline tiles, automatic findings, outcome and token donuts, latency histogram, matrix heatmap), comparison winner tiles, compare scoreboard with inline bars, synthetic exact-length prompts in chat and compare, visible run-selection action bar |
+| **v0.4** | Exports (JSON, CSV, HTML, Markdown), import, saved test definitions, goodput/SLOs |
 | **v1.0** | Authentication (password, then OIDC), dataset import, ramp/soak tests, Prometheus endpoint, Helm chart |
 | **Later** | Agent mode for distributed load, Bedrock adapter, k6 export, scheduled runs, optional PostgreSQL backend |
 

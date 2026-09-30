@@ -401,6 +401,21 @@ func (m *Manager) Provider(ctx context.Context, id string) (providers.Provider, 
 	return p, nil
 }
 
+// LoadProvider returns a dedicated, uncached adapter for a load test with a
+// connection pool of maxConns and, if timeout > 0, a per-request timeout
+// overriding the source's.
+func (m *Manager) LoadProvider(ctx context.Context, id string, maxConns int, timeout time.Duration) (providers.Provider, error) {
+	cfg, err := m.providerConfig(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	cfg.MaxConns = maxConns
+	if timeout > 0 {
+		cfg.Timeout = timeout
+	}
+	return providers.New(cfg)
+}
+
 // Discover fetches the model list from the source's /models endpoint.
 func (m *Manager) Discover(ctx context.Context, id string) ([]string, error) {
 	p, err := m.Provider(ctx, id)

@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/metalgeekhub/llmbench/internal/clock"
 	"github.com/metalgeekhub/llmbench/internal/providers"
 )
 
@@ -17,7 +18,7 @@ type fakeProvider struct {
 func (f *fakeProvider) ListModels(context.Context) ([]string, error) { return nil, nil }
 
 func (f *fakeProvider) StreamChat(_ context.Context, _ providers.ChatRequest, emit func(providers.Event)) error {
-	base := time.Now()
+	base := clock.Now()
 	for _, e := range f.events {
 		e.At = base.Add(time.Duration(e.At.UnixNano()))
 		emit(e)

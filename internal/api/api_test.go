@@ -17,6 +17,9 @@ import (
 
 	"github.com/metalgeekhub/llmbench/internal/chat"
 	"github.com/metalgeekhub/llmbench/internal/config"
+	"github.com/metalgeekhub/llmbench/internal/definitions"
+	"github.com/metalgeekhub/llmbench/internal/profiles"
+	"github.com/metalgeekhub/llmbench/internal/runner"
 	"github.com/metalgeekhub/llmbench/internal/secrets"
 	"github.com/metalgeekhub/llmbench/internal/sources"
 	"github.com/metalgeekhub/llmbench/internal/store"
@@ -77,7 +80,10 @@ func newTestEnv(t *testing.T) *testEnv {
 		"index.html":                  {Data: []byte("<html>app</html>")},
 		"_app/immutable/entry/app.js": {Data: []byte("console.log(1)")},
 	}
-	h := New(Deps{Version: "test", Store: st, Sources: srcs, Chat: chat.NewService(st, srcs), UI: ui})
+	rn := runner.New(st, srcs)
+	rn.LiveInterval = 50 * time.Millisecond
+	h := New(Deps{Version: "test", Store: st, Sources: srcs, Chat: chat.NewService(st, srcs),
+		Runner: rn, Profiles: profiles.NewService(st, srcs), Definitions: definitions.NewService(st, rn), UI: ui})
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	return &testEnv{srv: srv, llm: llm, st: st}

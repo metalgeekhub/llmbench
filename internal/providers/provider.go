@@ -33,7 +33,13 @@ type Config struct {
 	ExtraBody     map[string]any
 	Timeout       time.Duration
 	TLSSkipVerify bool
+	// MaxConns sizes the connection pool (idle and total per host). Load
+	// tests set it to the concurrency level; 0 uses DefaultMaxConns.
+	MaxConns int
 }
+
+// DefaultMaxConns is the pool size for interactive use (chat).
+const DefaultMaxConns = 16
 
 // Message is one chat turn.
 type Message struct {
@@ -49,6 +55,51 @@ type ChatRequest struct {
 	MaxTokens   *int
 	// ExtraBody is deep-merged over the source's extra body.
 	ExtraBody map[string]any
+	// Thinking, if set, overrides any reasoning settings in the extra bodies.
+	Thinking *Thinking
+}
+
+// Normalized thinking levels.
+const (
+	ThinkingOff    = "off"
+	ThinkingLow    = "low"
+	ThinkingMedium = "medium"
+	ThinkingHigh   = "high"
+)
+
+// Ways an OpenAI-compatible server accepts the thinking control.
+const (
+	// StyleReasoningEffort sends reasoning_effort (OpenAI, gpt-oss). "off"
+	// is sent as "none", which older models may reject.
+	StyleReasoningEffort = "reasoning_effort"
+	// StyleChatTemplate sends chat_template_kwargs.enable_thinking (Qwen3,
+	// DeepSeek and similar on vLLM/SGLang). It is on/off only: low, medium
+	// and high all enable thinking.
+	StyleChatTemplate = "chat_template_kwargs"
+)
+
+// Thinking is the normalized reasoning control.
+type Thinking struct {
+	Level string
+	Style string
+}
+
+// ParseThinking validates a level/style pair. An empty level means "server
+// default" and returns nil.
+func ParseThinking(level, style string) (*Thinking, error) {
+	switch level {
+	case "":
+		return nil, nil
+	case ThinkingOff, ThinkingLow, ThinkingMedium, ThinkingHigh:
+	default:
+		return nil, fmt.Errorf("unknown thinking level %q (use off, low, medium or high)", level)
+	}
+	switch style {
+	case StyleReasoningEffort, StyleChatTemplate:
+	default:
+		return nil, fmt.Errorf("choose how to send the thinking level: %s or %s", StyleReasoningEffort, StyleChatTemplate)
+	}
+	return &Thinking{Level: level, Style: style}, nil
 }
 
 // EventType identifies a normalized stream event.
@@ -164,6 +215,15 @@ func httpStatusError(status int, body string) *Error {
 
 func newHTTPClient(cfg Config) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	// The default of 2 idle connections per host would force reconnects
+	// (and skew latency) as soon as more than two requests run at once.
+	conns := cfg.MaxConns
+	if conns <= 0 {
+		conns = DefaultMaxConns
+	}
+	tr.MaxIdleConns = conns
+	tr.MaxIdleConnsPerHost = conns
+	tr.MaxConnsPerHost = conns
 	if cfg.TLSSkipVerify {
 		tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec // user opt-in per source
 	}

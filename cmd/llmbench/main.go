@@ -17,6 +17,9 @@ import (
 	"github.com/metalgeekhub/llmbench/internal/api"
 	"github.com/metalgeekhub/llmbench/internal/chat"
 	"github.com/metalgeekhub/llmbench/internal/config"
+	"github.com/metalgeekhub/llmbench/internal/definitions"
+	"github.com/metalgeekhub/llmbench/internal/profiles"
+	"github.com/metalgeekhub/llmbench/internal/runner"
 	"github.com/metalgeekhub/llmbench/internal/secrets"
 	"github.com/metalgeekhub/llmbench/internal/sources"
 	"github.com/metalgeekhub/llmbench/internal/store"
@@ -108,17 +111,34 @@ func serve() error {
 		slog.Info("environment source", "name", s.Name, "type", s.Type, "base_url", s.BaseURL)
 	}
 
+	if n, err := st.MarkInterruptedRuns(ctx); err != nil {
+		return err
+	} else if n > 0 {
+		slog.Warn("marked benchmark runs from a previous process as interrupted", "count", n)
+	}
+	runs := runner.New(st, srcs)
+	// Runs after the HTTP server stops and before the database closes, so
+	// stopped runs record their partial results.
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		runs.Shutdown(shutdownCtx)
+	}()
+
 	files, built := ui.Files()
 	if !built {
 		slog.Warn("web UI not built into this binary; serving a placeholder page (run make build)")
 	}
 
 	handler := api.New(api.Deps{
-		Version: version,
-		Store:   st,
-		Sources: srcs,
-		Chat:    chat.NewService(st, srcs),
-		UI:      files,
+		Version:     version,
+		Store:       st,
+		Sources:     srcs,
+		Chat:        chat.NewService(st, srcs),
+		Profiles:    profiles.NewService(st, srcs),
+		Definitions: definitions.NewService(st, runs),
+		Runner:      runs,
+		UI:          files,
 	})
 
 	srv := &http.Server{

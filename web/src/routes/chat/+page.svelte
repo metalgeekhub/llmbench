@@ -3,19 +3,25 @@
 	import { page } from '$app/state';
 	import { onMount, tick, untrack } from 'svelte';
 	import {
+		createProfile,
 		createSession,
 		deleteSession,
 		getSession,
+		listProfiles,
 		listSessions,
 		listSources,
 		sendMessage,
 		sourceModels
 	} from '$lib/api';
 	import { ms, relativeTime } from '$lib/format';
-	import type { ChatMessage, ChatParams, ChatSession, Source } from '$lib/types';
+	import { emptyParams, normalizeParams, thinkingLabel } from '$lib/params';
+	import type { ChatMessage, ChatParams, ChatSession, Profile, Source } from '$lib/types';
 	import Markdown from '$lib/components/Markdown.svelte';
 	import MetricsStrip from '$lib/components/MetricsStrip.svelte';
+	import ParamsEditor from '$lib/components/ParamsEditor.svelte';
 	import RequestDetail from '$lib/components/RequestDetail.svelte';
+	import SyntheticControl from '$lib/components/SyntheticControl.svelte';
+	import UserPrompt from '$lib/components/UserPrompt.svelte';
 
 	type UIMessage = ChatMessage & { pending?: boolean };
 
@@ -34,12 +40,15 @@
 	let modelsLoading = $state(false);
 
 	let showParams = $state(false);
-	let temperature = $state('');
-	let maxTokens = $state('');
-	let systemPrompt = $state('');
-	let extraBody = $state('');
+	let params = $state<ChatParams>(emptyParams());
+	let paramsError = $state('');
+	let profiles = $state<Profile[]>([]);
+	/** The profile the current settings came from ('' = none). */
+	let profileId = $state('');
 
 	let input = $state('');
+	let synthetic = $state(false);
+	let synthTokens = $state(4096);
 	let streaming = $state(false);
 	let abort: AbortController | null = null;
 	let error = $state('');
@@ -48,15 +57,7 @@
 
 	const urlSession = $derived(page.url.searchParams.get('s'));
 	const modelOptions = $derived(model && !models.includes(model) ? [model, ...models] : models);
-	const extraBodyError = $derived.by(() => {
-		if (!extraBody.trim()) return '';
-		try {
-			const v = JSON.parse(extraBody);
-			return v && typeof v === 'object' && !Array.isArray(v) ? '' : 'Must be a JSON object';
-		} catch {
-			return 'Invalid JSON';
-		}
-	});
+	const currentSource = $derived(sources.find((s) => s.id === sourceId));
 
 	onMount(() => {
 		listSources()
@@ -65,8 +66,32 @@
 				if (!sourceId && s.length) sourceId = s[0].id;
 			})
 			.catch((e) => (error = e.message));
+		listProfiles()
+			.then((p) => (profiles = p))
+			.catch(() => {});
 		refreshSessions();
 	});
+
+	function applyProfile(id: string) {
+		profileId = id;
+		const p = profiles.find((x) => x.id === id);
+		if (!p) return;
+		sourceId = p.source_id;
+		model = p.model;
+		params = normalizeParams($state.snapshot(p.params));
+	}
+
+	async function saveAsProfile() {
+		const name = prompt('Profile name', `${model}${params.thinking ? ` · thinking ${params.thinking}` : ''}`);
+		if (!name?.trim()) return;
+		try {
+			const p = await createProfile({ name: name.trim(), source_id: sourceId, model, params: $state.snapshot(params) });
+			profiles = [...profiles, p].sort((a, b) => a.name.localeCompare(b.name));
+			profileId = p.id;
+		} catch (e) {
+			error = (e as Error).message;
+		}
+	}
 
 	// Follow the ?s= URL parameter. Only the URL is tracked: send() sets
 	// sessionId before navigating, which must not reset the conversation.
@@ -122,34 +147,18 @@
 			messages = d.messages;
 			if (d.source_id) sourceId = d.source_id;
 			if (d.model) model = d.model;
-			applyParams(d.params);
+			params = normalizeParams(d.params);
+			profileId = d.profile_id ?? '';
 			await scrollToBottom(true);
 		} catch (e) {
 			error = (e as Error).message;
 		}
 	}
 
-	function applyParams(p: ChatParams) {
-		temperature = p.temperature == null ? '' : String(p.temperature);
-		maxTokens = p.max_tokens == null ? '' : String(p.max_tokens);
-		systemPrompt = p.system_prompt ?? '';
-		extraBody = p.extra_body && Object.keys(p.extra_body).length ? JSON.stringify(p.extra_body, null, 2) : '';
-	}
-
-	function buildParams(): ChatParams {
-		const t = temperature.trim();
-		const mt = maxTokens.trim();
-		return {
-			temperature: t === '' ? null : Number(t),
-			max_tokens: mt === '' ? null : Math.trunc(Number(mt)),
-			system_prompt: systemPrompt,
-			extra_body: extraBody.trim() ? JSON.parse(extraBody) : null
-		};
-	}
-
 	function onSourceChange() {
 		model = '';
 		models = [];
+		profileId = '';
 	}
 
 	function newChat() {
@@ -180,6 +189,7 @@
 			request_id: '',
 			created_at: new Date().toISOString(),
 			request: null,
+			synthetic_tokens: 0,
 			pending: true
 		};
 	}
@@ -192,22 +202,17 @@
 
 	async function send() {
 		const content = input.trim();
-		if (!content || streaming) return;
+		if ((!content && !synthetic) || streaming) return;
 		if (!sourceId || !model) {
 			error = 'Select a source and a model first.';
 			return;
 		}
-		if (extraBodyError) {
-			error = `Extra body: ${extraBodyError}`;
+		if (paramsError) {
+			error = paramsError;
 			showParams = true;
 			return;
 		}
-		const params = buildParams();
-		if ((params.temperature != null && isNaN(params.temperature)) || (params.max_tokens != null && isNaN(params.max_tokens))) {
-			error = 'Temperature and max tokens must be numbers.';
-			showParams = true;
-			return;
-		}
+		const sendParams = $state.snapshot(params);
 
 		error = '';
 		streaming = true;
@@ -217,17 +222,21 @@
 		let id = sessionId;
 		try {
 			if (!id) {
-				const s = await createSession({ source_id: sourceId, model, params });
+				const s = await createSession({ source_id: sourceId, model, params: sendParams, profile_id: profileId });
 				id = s.id;
 				sessionId = id;
 				goto(`/chat?s=${id}`, { keepFocus: true, noScroll: true });
 			}
-			messages.push(blankMessage(PENDING_USER, 'user', content), blankMessage(PENDING_ASSISTANT, 'assistant'));
+			// The server builds the real synthetic text; show a placeholder until it echoes it back.
+			const pendingUser = synthetic
+				? { ...blankMessage(PENDING_USER, 'user', `…\n\n${content || 'Continue the story above in as much detail as you can.'}`), synthetic_tokens: synthTokens }
+				: blankMessage(PENDING_USER, 'user', content);
+			messages.push(pendingUser, blankMessage(PENDING_ASSISTANT, 'assistant'));
 			await scrollToBottom(true);
 
 			await sendMessage(
 				id,
-				{ content, source_id: sourceId, model, params },
+				{ content, source_id: sourceId, model, params: sendParams, profile_id: profileId, synthetic_tokens: synthetic ? synthTokens : 0 },
 				{
 					onUserMessage: (m) => replaceMessage(PENDING_USER, m),
 					onDelta: (kind, text) => {
@@ -323,6 +332,20 @@
 	<!-- Conversation -->
 	<section class="flex min-w-0 flex-1 flex-col">
 		<div class="flex flex-wrap items-center gap-2 border-b border-stone-200 bg-white px-4 py-2 text-sm">
+			{#if profiles.length}
+				<label class="flex items-center gap-1.5">
+					<span class="text-stone-500">Profile</span>
+					<select
+						class="max-w-56 rounded-md border border-stone-300 bg-white px-2 py-1"
+						value={profileId}
+						onchange={(e) => applyProfile(e.currentTarget.value)}
+						disabled={streaming}
+					>
+						<option value="">None</option>
+						{#each profiles as p (p.id)}<option value={p.id}>{p.name}</option>{/each}
+					</select>
+				</label>
+			{/if}
 			<label class="flex items-center gap-1.5">
 				<span class="text-stone-500">Source</span>
 				<select
@@ -338,7 +361,7 @@
 			</label>
 			<label class="flex items-center gap-1.5">
 				<span class="text-stone-500">Model</span>
-				<select class="max-w-72 rounded-md border border-stone-300 bg-white px-2 py-1" bind:value={model} disabled={streaming}>
+				<select class="max-w-72 rounded-md border border-stone-300 bg-white px-2 py-1" bind:value={model} onchange={() => (profileId = '')} disabled={streaming}>
 					{#each modelOptions as m (m)}
 						<option value={m}>{m}</option>
 					{/each}
@@ -359,7 +382,7 @@
 				class="rounded-md px-2.5 py-1 {showParams ? 'bg-stone-100 text-stone-900' : 'text-stone-600 hover:bg-stone-100'}"
 				onclick={() => (showParams = !showParams)}
 			>
-				Parameters
+				Parameters{#if params.thinking}<span class="ml-1 rounded bg-blue-50 px-1 text-xs text-blue-800">{thinkingLabel(params)}</span>{/if}
 			</button>
 		</div>
 
@@ -375,8 +398,8 @@
 				<div class="mx-auto flex max-w-3xl flex-col gap-5">
 					{#each messages as m (m.id)}
 						{#if m.role === 'user'}
-							<div class="self-end rounded-lg bg-blue-50 px-4 py-2.5 whitespace-pre-wrap text-stone-900 max-w-[85%]">
-								{m.content}
+							<div class="self-end rounded-lg bg-blue-50 px-4 py-2.5 text-stone-900 max-w-[85%]">
+								<UserPrompt content={m.content} syntheticTokens={m.synthetic_tokens} />
 							</div>
 						{:else}
 							<div class="max-w-full">
@@ -419,29 +442,15 @@
 			{#if showParams}
 				<aside class="w-72 shrink-0 overflow-y-auto border-l border-stone-200 bg-white p-4 text-sm">
 					<h2 class="mb-3 font-semibold">Parameters</h2>
-					<label class="mb-3 block">
-						<span class="mb-1 block text-xs text-stone-500">Temperature</span>
-						<input class="w-full rounded-md border border-stone-300 px-2 py-1" type="number" step="0.1" min="0" max="2" placeholder="server default" bind:value={temperature} />
-					</label>
-					<label class="mb-3 block">
-						<span class="mb-1 block text-xs text-stone-500">Max tokens</span>
-						<input class="w-full rounded-md border border-stone-300 px-2 py-1" type="number" min="1" step="1" placeholder="server default" bind:value={maxTokens} />
-					</label>
-					<label class="mb-3 block">
-						<span class="mb-1 block text-xs text-stone-500">System prompt</span>
-						<textarea class="w-full rounded-md border border-stone-300 px-2 py-1" rows="4" bind:value={systemPrompt}></textarea>
-					</label>
-					<label class="mb-1 block">
-						<span class="mb-1 block text-xs text-stone-500">Extra body (JSON, merged into the request)</span>
-						<textarea
-							class="w-full rounded-md border px-2 py-1 font-mono text-xs {extraBodyError ? 'border-red-400' : 'border-stone-300'}"
-							rows="5"
-							placeholder={'{"top_k": 20}'}
-							bind:value={extraBody}
-						></textarea>
-					</label>
-					{#if extraBodyError}<p class="text-xs text-red-700">{extraBodyError}</p>{/if}
+					<ParamsEditor bind:params bind:error={paramsError} baseUrl={currentSource?.base_url} />
 					<p class="mt-3 text-xs text-stone-400">Parameters are saved with the chat when you send a message.</p>
+					<button
+						class="mt-3 w-full rounded-md border border-stone-300 px-3 py-1.5 text-xs hover:bg-stone-50 disabled:opacity-40"
+						disabled={!sourceId || !model || !!paramsError}
+						onclick={saveAsProfile}
+					>
+						Save as profile…
+					</button>
 				</aside>
 			{/if}
 		</div>
@@ -454,11 +463,12 @@
 		{/if}
 
 		<div class="border-t border-stone-200 bg-white p-3">
+			<div class="mx-auto mb-2 max-w-3xl"><SyntheticControl bind:enabled={synthetic} bind:tokens={synthTokens} disabled={streaming} /></div>
 			<div class="mx-auto flex max-w-3xl items-end gap-2">
 				<textarea
 					class="max-h-48 min-h-10 flex-1 resize-y rounded-md border border-stone-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none"
 					rows="2"
-					placeholder="Message (Enter to send, Shift+Enter for a new line)"
+					placeholder={synthetic ? `Optional instruction after the ${synthTokens}-token synthetic text (Enter to send)` : "Message (Enter to send, Shift+Enter for a new line)"}
 					bind:value={input}
 					onkeydown={onKeydown}
 					disabled={sources.length === 0}
@@ -470,7 +480,7 @@
 				{:else}
 					<button
 						class="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-40"
-						disabled={!input.trim() || !model}
+						disabled={(!input.trim() && !synthetic) || !model}
 						onclick={send}
 					>
 						Send

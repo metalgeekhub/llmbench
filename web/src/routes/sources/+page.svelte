@@ -1,8 +1,50 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { deleteSource, discoverModels, listSources } from '$lib/api';
-	import type { Source } from '$lib/types';
+	import { deleteProfile, deleteSource, discoverModels, listProfiles, listSources } from '$lib/api';
+	import { THINKING_STYLES } from '$lib/params';
+	import type { Profile, Source } from '$lib/types';
+	import ProfileForm from '$lib/components/ProfileForm.svelte';
 	import SourceForm from '$lib/components/SourceForm.svelte';
+
+	let profiles = $state<Profile[]>([]);
+	/** 'new', a profile ID being edited, or null. */
+	let editingProfile = $state<string | null>(null);
+
+	async function loadProfiles() {
+		try {
+			profiles = await listProfiles();
+		} catch (e) {
+			error = (e as Error).message;
+		}
+	}
+
+	async function removeProfile(p: Profile) {
+		if (!confirm(`Delete profile "${p.name}"?`)) return;
+		try {
+			await deleteProfile(p.id);
+			await loadProfiles();
+		} catch (e) {
+			error = (e as Error).message;
+		}
+	}
+
+	async function profileSaved() {
+		editingProfile = null;
+		await loadProfiles();
+	}
+
+	function profileSummary(p: Profile): string {
+		const parts = [];
+		if (p.params.thinking) {
+			const style = THINKING_STYLES.find((s) => s.value === p.params.thinking_style)?.value ?? '';
+			parts.push(`thinking ${p.params.thinking} (${style})`);
+		}
+		if (p.params.temperature != null) parts.push(`temperature ${p.params.temperature}`);
+		if (p.params.max_tokens != null) parts.push(`max ${p.params.max_tokens} tokens`);
+		if (p.params.system_prompt) parts.push('system prompt');
+		if (p.params.extra_body && Object.keys(p.params.extra_body).length) parts.push('extra body');
+		return parts.join(' · ') || 'server defaults';
+	}
 
 	let sources = $state<Source[]>([]);
 	let loading = $state(true);
@@ -13,7 +55,10 @@
 
 	const editingSource = $derived(sources.find((s) => s.id === editing));
 
-	onMount(load);
+	onMount(() => {
+		load();
+		loadProfiles();
+	});
 
 	async function load() {
 		try {
@@ -153,6 +198,61 @@
 							{/if}
 						</div>
 					{/if}
+				{/if}
+			</li>
+		{/each}
+	</ul>
+
+	<!-- Model profiles -->
+	<div class="mt-10 mb-4 flex items-center justify-between">
+		<div>
+			<h2 class="text-lg font-semibold">Model profiles</h2>
+			<p class="text-sm text-stone-500">
+				A model plus saved settings, e.g. "Qwen thinking-high" and "Qwen no-thinking". Use them in chat, compare and benchmarks like separate models.
+			</p>
+		</div>
+		{#if editingProfile === null && sources.length > 0}
+			<button class="shrink-0 rounded-md border border-stone-300 bg-white px-3 py-1.5 text-sm hover:bg-stone-50" onclick={() => (editingProfile = 'new')}>
+				+ Add profile
+			</button>
+		{/if}
+	</div>
+
+	{#if editingProfile === 'new'}
+		<div class="mb-4 rounded-lg border border-stone-200 bg-white p-5">
+			<h3 class="mb-4 font-semibold">New profile</h3>
+			<ProfileForm {sources} onsaved={profileSaved} oncancel={() => (editingProfile = null)} />
+		</div>
+	{/if}
+
+	{#if profiles.length === 0 && editingProfile === null}
+		<p class="rounded-md border border-dashed border-stone-300 p-4 text-sm text-stone-500">
+			No profiles yet. Create one here, or use "Save as profile…" in the chat's parameters panel.
+		</p>
+	{/if}
+
+	<ul class="space-y-2 pb-10">
+		{#each profiles as p (p.id)}
+			<li class="rounded-lg border border-stone-200 bg-white p-4">
+				{#if editingProfile === p.id}
+					<h3 class="mb-4 font-semibold">Edit {p.name}</h3>
+					{#key p.id}
+						<ProfileForm profile={p} {sources} onsaved={profileSaved} oncancel={() => (editingProfile = null)} />
+					{/key}
+				{:else}
+					<div class="flex flex-wrap items-start justify-between gap-3">
+						<div class="min-w-0">
+							<h3 class="font-medium">{p.name}</h3>
+							<p class="text-xs text-stone-500">
+								<span class="font-mono">{p.model}</span> on {sources.find((s) => s.id === p.source_id)?.name ?? `missing source (${p.source_id})`}
+							</p>
+							<p class="mt-1 text-xs text-stone-600">{profileSummary(p)}</p>
+						</div>
+						<div class="flex gap-1 text-sm">
+							<button class="rounded px-2.5 py-1 text-stone-600 hover:bg-stone-100" onclick={() => (editingProfile = p.id)}>Edit</button>
+							<button class="rounded px-2.5 py-1 text-red-700 hover:bg-red-50" onclick={() => removeProfile(p)}>Delete</button>
+						</div>
+					</div>
 				{/if}
 			</li>
 		{/each}

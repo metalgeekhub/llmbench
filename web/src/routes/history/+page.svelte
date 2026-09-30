@@ -18,6 +18,7 @@
 	let sourceId = $state('');
 	let model = $state('');
 	let status = $state('');
+	let kind = $state('');
 	let offset = $state(0);
 	// ?r=<id> opens a request's details directly (shareable link).
 	let detailId = $state<string | null>(page.url.searchParams.get('r'));
@@ -29,7 +30,7 @@
 
 	// Reload whenever a filter or the page changes.
 	$effect(() => {
-		const filter = { source_id: sourceId, model, status, offset, limit: PAGE_SIZE };
+		const filter = { kind, source_id: sourceId, model, status, offset, limit: PAGE_SIZE };
 		loading = true;
 		listRequests(filter)
 			.then((r) => {
@@ -57,6 +58,11 @@
 			<p class="text-sm text-stone-500">Every request made by LLMBench, with its measured metrics.</p>
 		</div>
 		<div class="flex flex-wrap gap-2">
+			<select class={selectClass} value={kind} onchange={(e) => setFilter(() => (kind = e.currentTarget.value))} aria-label="Filter by kind">
+				<option value="">Chat and benchmarks</option>
+				<option value="chat">Chat</option>
+				<option value="test">Benchmarks</option>
+			</select>
 			<select class={selectClass} value={sourceId} onchange={(e) => setFilter(() => (sourceId = e.currentTarget.value))} aria-label="Filter by source">
 				<option value="">All sources</option>
 				{#each sources as s (s.id)}<option value={s.id}>{s.name}</option>{/each}
@@ -102,6 +108,7 @@
 						<td class="max-w-56 truncate px-3 py-2 font-mono text-xs" title={r.model}>{r.model}</td>
 						<td class="px-3 py-2 whitespace-nowrap {r.status === 'ok' ? 'text-green-800' : 'text-red-800'}" title={r.error_message}>
 							{statusLabel[r.status] ?? r.status}{r.http_status ? ` ${r.http_status}` : ''}
+							{#if r.warmup}<span class="ml-1 rounded bg-stone-100 px-1 text-xs text-stone-500">warm-up</span>{/if}
 						</td>
 						<td class="px-3 py-2 text-right font-mono whitespace-nowrap">{ms(r.metrics.ttft_ms)}</td>
 						<td class="px-3 py-2 text-right font-mono whitespace-nowrap">{ms(r.metrics.e2e_ms)}</td>
@@ -113,6 +120,8 @@
 						<td class="px-3 py-2 whitespace-nowrap">
 							{#if r.session_id}
 								<a href="/chat?s={r.session_id}" class="text-xs text-blue-700 hover:underline" onclick={(e) => e.stopPropagation()}>chat →</a>
+							{:else if r.run_id}
+								<a href="/benchmarks/{r.run_id}" class="text-xs text-blue-700 hover:underline" onclick={(e) => e.stopPropagation()}>benchmark →</a>
 							{/if}
 						</td>
 					</tr>

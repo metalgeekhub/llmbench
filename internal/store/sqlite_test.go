@@ -104,7 +104,7 @@ func TestChatAndRequestsPersistAcrossReopen(t *testing.T) {
 	}
 	defer s2.Close()
 
-	sessions, err := s2.ListSessions(ctx)
+	sessions, err := s2.ListSessions(ctx, "")
 	if err != nil || len(sessions) != 1 || sessions[0].Params.SystemPrompt != "be brief" || *sessions[0].Params.Temperature != 0.7 {
 		t.Fatalf("sessions = %+v, %v", sessions, err)
 	}

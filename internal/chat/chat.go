@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"unicode/utf8"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/metalgeekhub/llmbench/internal/providers"
 	"github.com/metalgeekhub/llmbench/internal/sources"
 	"github.com/metalgeekhub/llmbench/internal/store"
+	"github.com/metalgeekhub/llmbench/internal/tokenizer"
 )
 
 const titleLength = 60
@@ -34,13 +36,23 @@ func NewService(st store.Store, src *sources.Manager) *Service {
 // SessionInput creates or updates a session. Nil/empty fields are left
 // unchanged on update.
 type SessionInput struct {
-	Title    *string           `json:"title"`
-	SourceID *string           `json:"source_id"`
-	Model    *string           `json:"model"`
-	Params   *store.ChatParams `json:"params"`
+	Title     *string           `json:"title"`
+	SourceID  *string           `json:"source_id"`
+	Model     *string           `json:"model"`
+	Params    *store.ChatParams `json:"params"`
+	ProfileID *string           `json:"profile_id"`
+	// CompareID is only honoured on create: it makes the session a column
+	// of a side-by-side comparison.
+	CompareID string `json:"compare_id"`
 }
 
-func (in SessionInput) applyTo(s *store.ChatSession) {
+func (in SessionInput) applyTo(s *store.ChatSession) error {
+	if in.Params != nil {
+		if err := in.Params.Validate(); err != nil {
+			return fmt.Errorf("%w: %s", ErrInvalid, err.Error())
+		}
+		s.Params = *in.Params
+	}
 	if in.Title != nil {
 		s.Title = strings.TrimSpace(*in.Title)
 	}
@@ -50,14 +62,17 @@ func (in SessionInput) applyTo(s *store.ChatSession) {
 	if in.Model != nil {
 		s.Model = *in.Model
 	}
-	if in.Params != nil {
-		s.Params = *in.Params
+	if in.ProfileID != nil {
+		s.ProfileID = *in.ProfileID
 	}
+	return nil
 }
 
 func (s *Service) CreateSession(ctx context.Context, in SessionInput) (store.ChatSession, error) {
-	sess := store.ChatSession{ID: uuid.NewString()}
-	in.applyTo(&sess)
+	sess := store.ChatSession{ID: uuid.NewString(), CompareID: strings.TrimSpace(in.CompareID)}
+	if err := in.applyTo(&sess); err != nil {
+		return store.ChatSession{}, err
+	}
 	if err := s.store.CreateSession(ctx, &sess); err != nil {
 		return store.ChatSession{}, err
 	}
@@ -69,11 +84,42 @@ func (s *Service) UpdateSession(ctx context.Context, id string, in SessionInput)
 	if err != nil {
 		return store.ChatSession{}, err
 	}
-	in.applyTo(&sess)
+	if err := in.applyTo(&sess); err != nil {
+		return store.ChatSession{}, err
+	}
 	if err := s.store.UpdateSession(ctx, &sess); err != nil {
 		return store.ChatSession{}, err
 	}
 	return sess, nil
+}
+
+// CompareDetail is a comparison with every column's full history.
+type CompareDetail struct {
+	ID       string          `json:"id"`
+	Title    string          `json:"title"`
+	Sessions []SessionDetail `json:"sessions"`
+}
+
+func (s *Service) GetCompare(ctx context.Context, compareID string) (CompareDetail, error) {
+	sessions, err := s.store.ListSessions(ctx, compareID)
+	if err != nil {
+		return CompareDetail{}, err
+	}
+	if compareID == "" || len(sessions) == 0 {
+		return CompareDetail{}, store.ErrNotFound
+	}
+	d := CompareDetail{ID: compareID, Sessions: make([]SessionDetail, 0, len(sessions))}
+	for _, sess := range sessions {
+		sd, err := s.GetSession(ctx, sess.ID)
+		if err != nil {
+			return CompareDetail{}, err
+		}
+		if d.Title == "" {
+			d.Title = sd.Title
+		}
+		d.Sessions = append(d.Sessions, sd)
+	}
+	return d, nil
 }
 
 // MessageView is a chat message with the metrics of the request that
@@ -116,11 +162,23 @@ func (s *Service) GetSession(ctx context.Context, id string) (SessionDetail, err
 // SendInput is a new user message. SourceID, Model and Params, when set,
 // update the session before sending.
 type SendInput struct {
-	Content  string            `json:"content"`
-	SourceID string            `json:"source_id"`
-	Model    string            `json:"model"`
-	Params   *store.ChatParams `json:"params"`
+	Content   string            `json:"content"`
+	SourceID  string            `json:"source_id"`
+	Model     string            `json:"model"`
+	Params    *store.ChatParams `json:"params"`
+	ProfileID *string           `json:"profile_id"`
+	// SyntheticTokens > 0 sends a synthetic prompt of that many tokens
+	// instead of typed text; Content, if set, becomes its closing
+	// instruction. Each request gets a unique prefix so prefix caching can't
+	// favor one compare column over another.
+	SyntheticTokens int `json:"synthetic_tokens"`
 }
+
+// Synthetic prompt limits for chat.
+const (
+	MinSyntheticTokens = 16
+	MaxSyntheticTokens = 500_000
+)
 
 // Stream event names.
 const (
@@ -146,7 +204,17 @@ type Done struct {
 // reported in the Done event's request.
 func (s *Service) Send(ctx context.Context, sessionID string, in SendInput, emit func(event string, data any)) error {
 	content := strings.TrimSpace(in.Content)
-	if content == "" {
+	title := content
+	switch n := in.SyntheticTokens; {
+	case n > 0:
+		if n < MinSyntheticTokens || n > MaxSyntheticTokens {
+			return fmt.Errorf("%w: synthetic prompts must be %d to %d tokens", ErrInvalid, MinSyntheticTokens, MaxSyntheticTokens)
+		}
+		title = fmt.Sprintf("Synthetic prompt · %d tokens", n)
+		content = fmt.Sprintf("[%016x] %s", rand.Uint64(), tokenizer.SyntheticPrompt(n, content))
+	case n < 0:
+		return fmt.Errorf("%w: synthetic token count must be positive", ErrInvalid)
+	case content == "":
 		return fmt.Errorf("%w: message content is empty", ErrInvalid)
 	}
 	sess, err := s.store.GetSession(ctx, sessionID)
@@ -162,8 +230,18 @@ func (s *Service) Send(ctx context.Context, sessionID string, in SendInput, emit
 	if in.Params != nil {
 		sess.Params = *in.Params
 	}
+	if in.ProfileID != nil {
+		sess.ProfileID = *in.ProfileID
+	}
 	if sess.SourceID == "" || sess.Model == "" {
 		return fmt.Errorf("%w: select a source and model first", ErrInvalid)
+	}
+	thinking, err := sess.Params.ThinkingControl()
+	if err == nil {
+		err = sess.Params.Validate()
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrInvalid, err.Error())
 	}
 	src, err := s.sources.Get(ctx, sess.SourceID)
 	if err != nil {
@@ -178,12 +256,13 @@ func (s *Service) Send(ctx context.Context, sessionID string, in SendInput, emit
 	if err != nil {
 		return err
 	}
-	userMsg := store.ChatMessage{ID: uuid.NewString(), SessionID: sessionID, Role: "user", Content: content}
+	userMsg := store.ChatMessage{ID: uuid.NewString(), SessionID: sessionID, Role: "user", Content: content,
+		SyntheticTokens: in.SyntheticTokens}
 	if err := s.store.AddMessage(ctx, &userMsg); err != nil {
 		return err
 	}
 	if sess.Title == "" {
-		sess.Title = truncate(content, titleLength)
+		sess.Title = truncate(title, titleLength)
 	}
 	emit(EventUserMessage, MessageView{ChatMessage: userMsg})
 
@@ -193,6 +272,7 @@ func (s *Service) Send(ctx context.Context, sessionID string, in SendInput, emit
 		Temperature: sess.Params.Temperature,
 		MaxTokens:   sess.Params.MaxTokens,
 		ExtraBody:   sess.Params.ExtraBody,
+		Thinking:    thinking,
 	}
 	m := metrics.Collect(ctx, provider, req, func(e providers.Event) {
 		switch e.Type {
@@ -215,7 +295,7 @@ func (s *Service) Send(ctx context.Context, sessionID string, in SendInput, emit
 		Status:     m.Status,
 		StartedAt:  m.StartedAt,
 		Metrics:    m.Result,
-		Params:     requestParams(sess.Params),
+		Params:     sess.Params.Summary(),
 	}
 	if m.Err != nil {
 		record.ErrorType = m.Err.Type
@@ -260,23 +340,6 @@ func buildMessages(systemPrompt string, history []store.ChatMessage, next string
 		msgs = append(msgs, providers.Message{Role: h.Role, Content: h.Content})
 	}
 	return append(msgs, providers.Message{Role: "user", Content: next})
-}
-
-func requestParams(p store.ChatParams) map[string]any {
-	out := map[string]any{}
-	if p.Temperature != nil {
-		out["temperature"] = *p.Temperature
-	}
-	if p.MaxTokens != nil {
-		out["max_tokens"] = *p.MaxTokens
-	}
-	if p.SystemPrompt != "" {
-		out["system_prompt"] = p.SystemPrompt
-	}
-	if len(p.ExtraBody) > 0 {
-		out["extra_body"] = p.ExtraBody
-	}
-	return out
 }
 
 func truncate(s string, n int) string {

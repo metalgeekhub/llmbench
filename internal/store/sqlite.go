@@ -261,7 +261,7 @@ func orEmptySlice(s []string) []string {
 
 // --- chat sessions & messages ---
 
-const sessionColumns = `id, title, source_id, model, params, created_at, updated_at`
+const sessionColumns = `id, title, source_id, model, params, profile_id, compare_id, created_at, updated_at`
 
 func scanSession(sc scanner) (ChatSession, error) {
 	var (
@@ -269,7 +269,8 @@ func scanSession(sc scanner) (ChatSession, error) {
 		params               string
 		createdAt, updatedAt int64
 	)
-	if err := sc.Scan(&cs.ID, &cs.Title, &cs.SourceID, &cs.Model, &params, &createdAt, &updatedAt); err != nil {
+	if err := sc.Scan(&cs.ID, &cs.Title, &cs.SourceID, &cs.Model, &params, &cs.ProfileID, &cs.CompareID,
+		&createdAt, &updatedAt); err != nil {
 		return ChatSession{}, mapErr(err)
 	}
 	if err := fromJSON(params, &cs.Params); err != nil {
@@ -280,8 +281,8 @@ func scanSession(sc scanner) (ChatSession, error) {
 	return cs, nil
 }
 
-func (s *SQLite) ListSessions(ctx context.Context) ([]ChatSession, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT `+sessionColumns+` FROM chat_sessions ORDER BY updated_at DESC`)
+func (s *SQLite) querySessions(ctx context.Context, where string, args ...any) ([]ChatSession, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sessionColumns+` FROM chat_sessions WHERE `+where, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -297,6 +298,52 @@ func (s *SQLite) ListSessions(ctx context.Context) ([]ChatSession, error) {
 	return out, rows.Err()
 }
 
+func (s *SQLite) ListSessions(ctx context.Context, compareID string) ([]ChatSession, error) {
+	// Compare columns are shown left to right in creation order.
+	order := "updated_at DESC"
+	if compareID != "" {
+		order = "created_at, rowid"
+	}
+	return s.querySessions(ctx, `compare_id = ? ORDER BY `+order, compareID)
+}
+
+func (s *SQLite) ListCompares(ctx context.Context) ([]CompareGroup, error) {
+	sessions, err := s.querySessions(ctx, `compare_id != '' ORDER BY created_at, rowid`)
+	if err != nil {
+		return nil, err
+	}
+	byID := map[string]*CompareGroup{}
+	var order []string
+	for _, cs := range sessions {
+		g, ok := byID[cs.CompareID]
+		if !ok {
+			g = &CompareGroup{ID: cs.CompareID, Title: cs.Title}
+			byID[cs.CompareID] = g
+			order = append(order, cs.CompareID)
+		}
+		g.Sessions = append(g.Sessions, cs)
+		if cs.UpdatedAt.After(g.UpdatedAt) {
+			g.UpdatedAt = cs.UpdatedAt
+		}
+		if g.Title == "" {
+			g.Title = cs.Title
+		}
+	}
+	out := make([]CompareGroup, 0, len(order))
+	for _, id := range order {
+		out = append(out, *byID[id])
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].UpdatedAt.After(out[j].UpdatedAt) })
+	return out, nil
+}
+
+func (s *SQLite) DeleteCompare(ctx context.Context, compareID string) error {
+	if compareID == "" {
+		return ErrNotFound
+	}
+	return checkAffected(s.db.ExecContext(ctx, `DELETE FROM chat_sessions WHERE compare_id = ?`, compareID))
+}
+
 func (s *SQLite) GetSession(ctx context.Context, id string) (ChatSession, error) {
 	return scanSession(s.db.QueryRowContext(ctx, `SELECT `+sessionColumns+` FROM chat_sessions WHERE id = ?`, id))
 }
@@ -304,25 +351,86 @@ func (s *SQLite) GetSession(ctx context.Context, id string) (ChatSession, error)
 func (s *SQLite) CreateSession(ctx context.Context, cs *ChatSession) error {
 	now := time.Now().UTC()
 	cs.CreatedAt, cs.UpdatedAt = now, now
-	_, err := s.db.ExecContext(ctx, `INSERT INTO chat_sessions (`+sessionColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-		cs.ID, cs.Title, cs.SourceID, cs.Model, toJSON(cs.Params), toMillis(now), toMillis(now))
+	_, err := s.db.ExecContext(ctx, `INSERT INTO chat_sessions (`+sessionColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		cs.ID, cs.Title, cs.SourceID, cs.Model, toJSON(cs.Params), cs.ProfileID, cs.CompareID, toMillis(now), toMillis(now))
 	return mapErr(err)
 }
 
 func (s *SQLite) UpdateSession(ctx context.Context, cs *ChatSession) error {
 	cs.UpdatedAt = time.Now().UTC()
 	return checkAffected(s.db.ExecContext(ctx, `UPDATE chat_sessions SET
-		title = ?, source_id = ?, model = ?, params = ?, updated_at = ? WHERE id = ?`,
-		cs.Title, cs.SourceID, cs.Model, toJSON(cs.Params), toMillis(cs.UpdatedAt), cs.ID))
+		title = ?, source_id = ?, model = ?, params = ?, profile_id = ?, updated_at = ? WHERE id = ?`,
+		cs.Title, cs.SourceID, cs.Model, toJSON(cs.Params), cs.ProfileID, toMillis(cs.UpdatedAt), cs.ID))
 }
 
 func (s *SQLite) DeleteSession(ctx context.Context, id string) error {
 	return checkAffected(s.db.ExecContext(ctx, `DELETE FROM chat_sessions WHERE id = ?`, id))
 }
 
+// --- model profiles ---
+
+const profileColumns = `id, name, source_id, model, params, created_at, updated_at`
+
+func scanProfile(sc scanner) (Profile, error) {
+	var (
+		p                    Profile
+		params               string
+		createdAt, updatedAt int64
+	)
+	if err := sc.Scan(&p.ID, &p.Name, &p.SourceID, &p.Model, &params, &createdAt, &updatedAt); err != nil {
+		return Profile{}, mapErr(err)
+	}
+	if err := fromJSON(params, &p.Params); err != nil {
+		return Profile{}, fmt.Errorf("profile %s params: %w", p.ID, err)
+	}
+	p.CreatedAt = fromMillis(createdAt)
+	p.UpdatedAt = fromMillis(updatedAt)
+	return p, nil
+}
+
+func (s *SQLite) ListProfiles(ctx context.Context) ([]Profile, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+profileColumns+` FROM model_profiles ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Profile{}
+	for rows.Next() {
+		p, err := scanProfile(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) GetProfile(ctx context.Context, id string) (Profile, error) {
+	return scanProfile(s.db.QueryRowContext(ctx, `SELECT `+profileColumns+` FROM model_profiles WHERE id = ?`, id))
+}
+
+func (s *SQLite) CreateProfile(ctx context.Context, p *Profile) error {
+	now := time.Now().UTC()
+	p.CreatedAt, p.UpdatedAt = now, now
+	_, err := s.db.ExecContext(ctx, `INSERT INTO model_profiles (`+profileColumns+`) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		p.ID, p.Name, p.SourceID, p.Model, toJSON(p.Params), toMillis(now), toMillis(now))
+	return mapErr(err)
+}
+
+func (s *SQLite) UpdateProfile(ctx context.Context, p *Profile) error {
+	p.UpdatedAt = time.Now().UTC()
+	return checkAffected(s.db.ExecContext(ctx, `UPDATE model_profiles SET
+		name = ?, source_id = ?, model = ?, params = ?, updated_at = ? WHERE id = ?`,
+		p.Name, p.SourceID, p.Model, toJSON(p.Params), toMillis(p.UpdatedAt), p.ID))
+}
+
+func (s *SQLite) DeleteProfile(ctx context.Context, id string) error {
+	return checkAffected(s.db.ExecContext(ctx, `DELETE FROM model_profiles WHERE id = ?`, id))
+}
+
 func (s *SQLite) ListMessages(ctx context.Context, sessionID string) ([]ChatMessage, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT id, session_id, role, content, reasoning, source_id, model,
-		request_id, created_at FROM chat_messages WHERE session_id = ? ORDER BY created_at, rowid`, sessionID)
+		request_id, synthetic_tokens, created_at FROM chat_messages WHERE session_id = ? ORDER BY created_at, rowid`, sessionID)
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +440,7 @@ func (s *SQLite) ListMessages(ctx context.Context, sessionID string) ([]ChatMess
 		var m ChatMessage
 		var createdAt int64
 		if err := rows.Scan(&m.ID, &m.SessionID, &m.Role, &m.Content, &m.Reasoning, &m.SourceID, &m.Model,
-			&m.RequestID, &createdAt); err != nil {
+			&m.RequestID, &m.SyntheticTokens, &createdAt); err != nil {
 			return nil, err
 		}
 		m.CreatedAt = fromMillis(createdAt)
@@ -346,8 +454,8 @@ func (s *SQLite) AddMessage(ctx context.Context, m *ChatMessage) error {
 		m.CreatedAt = time.Now().UTC()
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO chat_messages (id, session_id, role, content, reasoning,
-		source_id, model, request_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		m.ID, m.SessionID, m.Role, m.Content, m.Reasoning, m.SourceID, m.Model, m.RequestID, toMillis(m.CreatedAt))
+		source_id, model, request_id, synthetic_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, m.SessionID, m.Role, m.Content, m.Reasoning, m.SourceID, m.Model, m.RequestID, m.SyntheticTokens, toMillis(m.CreatedAt))
 	return mapErr(err)
 }
 
@@ -355,24 +463,26 @@ func (s *SQLite) AddMessage(ctx context.Context, m *ChatMessage) error {
 
 const requestColumns = `id, kind, source_id, source_name, model, session_id, status, http_status,
 	error_type, error_message, started_at, ttft_ms, ttfat_ms, e2e_ms, tpot_ms, output_tps, prefill_tps,
-	input_tokens, output_tokens, reasoning_tokens, cached_tokens, tokens_estimated, chunk_count, itl, params`
+	input_tokens, output_tokens, reasoning_tokens, cached_tokens, tokens_estimated, chunk_count, itl, params,
+	run_id, cell_id, warmup`
 
 func scanRequest(sc scanner) (Request, error) {
 	var (
 		r                                     Request
 		startedAt                             int64
 		ttft, ttfat, tpot, outTPS, prefillTPS sql.NullFloat64
-		estimated                             int
+		estimated, warmup                     int
 		itl, params                           string
 	)
 	m := &r.Metrics
 	if err := sc.Scan(&r.ID, &r.Kind, &r.SourceID, &r.SourceName, &r.Model, &r.SessionID, &r.Status, &r.HTTPStatus,
 		&r.ErrorType, &r.ErrorMessage, &startedAt, &ttft, &ttfat, &m.E2EMs, &tpot, &outTPS, &prefillTPS,
 		&m.InputTokens, &m.OutputTokens, &m.ReasoningTokens, &m.CachedTokens, &estimated, &m.ChunkCount,
-		&itl, &params); err != nil {
+		&itl, &params, &r.RunID, &r.CellID, &warmup); err != nil {
 		return Request{}, mapErr(err)
 	}
 	r.StartedAt = fromMillis(startedAt)
+	r.Warmup = warmup != 0
 	m.TTFTMs, m.TTFATMs, m.TPOTMs = nullPtr(ttft), nullPtr(ttfat), nullPtr(tpot)
 	m.OutputTPS, m.PrefillTPS = nullPtr(outTPS), nullPtr(prefillTPS)
 	m.TokensEstimated = estimated != 0
@@ -393,32 +503,46 @@ func nullPtr(n sql.NullFloat64) *float64 {
 }
 
 func (s *SQLite) SaveRequest(ctx context.Context, r *Request, tl *Timeline) error {
+	return s.SaveRequests(ctx, []RequestRecord{{Request: *r, Timeline: tl}})
+}
+
+func (s *SQLite) SaveRequests(ctx context.Context, batch []RequestRecord) error {
+	if len(batch) == 0 {
+		return nil
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-
-	m := r.Metrics
-	if _, err := tx.ExecContext(ctx, `INSERT INTO requests (`+requestColumns+`)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.Kind, r.SourceID, r.SourceName, r.Model, r.SessionID, r.Status, r.HTTPStatus,
-		r.ErrorType, r.ErrorMessage, toMillis(r.StartedAt), m.TTFTMs, m.TTFATMs, m.E2EMs, m.TPOTMs,
-		m.OutputTPS, m.PrefillTPS, m.InputTokens, m.OutputTokens, m.ReasoningTokens, m.CachedTokens,
-		boolInt(m.TokensEstimated), m.ChunkCount, toJSON(m.ITL), toJSON(orEmptyMap(r.Params))); err != nil {
-		return mapErr(err)
-	}
-	if tl != nil {
-		data, err := compressJSON(tl)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO request_timelines (request_id, data) VALUES (?, ?)`,
-			r.ID, data); err != nil {
+	for i := range batch {
+		if err := insertRequest(ctx, tx, &batch[i].Request, batch[i].Timeline); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+func insertRequest(ctx context.Context, tx *sql.Tx, r *Request, tl *Timeline) error {
+	m := r.Metrics
+	if _, err := tx.ExecContext(ctx, `INSERT INTO requests (`+requestColumns+`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.Kind, r.SourceID, r.SourceName, r.Model, r.SessionID, r.Status, r.HTTPStatus,
+		r.ErrorType, r.ErrorMessage, toMillis(r.StartedAt), m.TTFTMs, m.TTFATMs, m.E2EMs, m.TPOTMs,
+		m.OutputTPS, m.PrefillTPS, m.InputTokens, m.OutputTokens, m.ReasoningTokens, m.CachedTokens,
+		boolInt(m.TokensEstimated), m.ChunkCount, toJSON(m.ITL), toJSON(orEmptyMap(r.Params)),
+		r.RunID, r.CellID, boolInt(r.Warmup)); err != nil {
+		return mapErr(err)
+	}
+	if tl == nil {
+		return nil
+	}
+	data, err := compressJSON(tl)
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO request_timelines (request_id, data) VALUES (?, ?)`, r.ID, data)
+	return err
 }
 
 func (s *SQLite) GetRequest(ctx context.Context, id string) (Request, error) {
@@ -439,6 +563,8 @@ func (s *SQLite) ListRequests(ctx context.Context, f RequestFilter) ([]Request, 
 	add("model", f.Model)
 	add("status", f.Status)
 	add("session_id", f.SessionID)
+	add("run_id", f.RunID)
+	add("cell_id", f.CellID)
 	clause := ""
 	if len(where) > 0 {
 		clause = " WHERE " + strings.Join(where, " AND ")

@@ -15,6 +15,19 @@ export function rate(v: number | null | undefined, unit = 'tok/s'): string {
 	return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${unit}`;
 }
 
+export function pct(v: number | null | undefined, digits = 1): string {
+	if (v == null) return DASH;
+	return `${v.toFixed(digits)}%`;
+}
+
+export function duration(seconds: number): string {
+	if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)} s`;
+	const m = Math.floor(seconds / 60);
+	const s = Math.round(seconds % 60);
+	if (m < 60) return `${m}m ${s}s`;
+	return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
 export function int(v: number | null | undefined): string {
 	if (v == null) return DASH;
 	return v.toLocaleString();
