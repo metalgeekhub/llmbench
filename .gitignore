@@ -1,0 +1,13 @@
+# Build output
+/bin/
+/tmp/
+
+# Local data (SQLite database, generated secret key)
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Built frontend copied into the Go embed directory by `make web`
+/internal/ui/dist/*
+!/internal/ui/dist/.gitkeep

@@ -1,0 +1,14 @@
+version: "2"
+
+linters:
+  # Default set: errcheck, govet, ineffassign, staticcheck, unused.
+  exclusions:
+    presets:
+      # Ignored errors from Close/Flush/fmt.Fprint* on idiomatic paths
+      # (defer resp.Body.Close(), test servers writing responses).
+      - std-error-handling
+  settings:
+    errcheck:
+      exclude-functions:
+        # Deferred Rollback after Commit always returns sql.ErrTxDone.
+        - (*database/sql.Tx).Rollback

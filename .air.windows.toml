@@ -1,0 +1,9 @@
+# Live reload for the Go backend during `make dev` on Windows (air needs .exe).
+root = "."
+tmp_dir = "tmp"
+
+[build]
+cmd = "go build -o ./tmp/llmbench.exe ./cmd/llmbench"
+entrypoint = ["./tmp/llmbench.exe", "serve"]
+include_ext = ["go", "sql"]
+exclude_dir = ["web", "tmp", "bin", "data", "docs", "internal\\ui\\dist"]
